@@ -1,1 +1,88 @@
+import requests
+from rdkit import Chem
+from rdkit.Chem import AllChem, Draw
+from rdkit import DataStructs
+import multiprocessing as mp
+import csv
+import time
+
+# ---------- CONFIGURACIÓN ----------
+smiles_base = "CC1=C[C@H](O)CC(C)(C)[C@H]1/C=C/C(C)=C/C=C/C(C)=C/C=C/C=C(C)/C=C/C=C(C)/C=C/C1=C(C)C[C@@H](O)CC1(C)C"
+umbral_similitud = 0.7
+num_procesos = mp.cpu_count()
+pausa_entre_solicitudes = 0.1  # segundos (KEGG recomienda no abusar de su API)
+
+# ---------- FUNCIONES ----------
+
+def get_all_kegg_ids():
+    """Obtiene todos los IDs KEGG de compuestos"""
+    url = 'https://rest.kegg.jp/list/compound'
+    r = requests.get(url)
+    return [line.split('\t')[0].replace('cpd:', '') for line in r.text.strip().split('\n')]
+
+def get_smiles_from_kegg(kegg_id):
+    """Devuelve el SMILES desde un ID KEGG"""
+    url = f'https://rest.kegg.jp/get/{kegg_id}/mol'
+    try:
+        time.sleep(pausa_entre_solicitudes)
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            mol = Chem.MolFromMolBlock(r.text)
+            if mol:
+                return Chem.MolToSmiles(mol)
+    except:
+        return None
+    return None
+
+def tanimoto_similarity_pair(smiles1, smiles2):
+    """Calcula similitud Tanimoto entre dos SMILES"""
+    mol1 = Chem.MolFromSmiles(smiles1)
+    mol2 = Chem.MolFromSmiles(smiles2)
+    if mol1 and mol2:
+        fp1 = AllChem.GetMorganFingerprintAsBitVect(mol1, 2)
+        fp2 = AllChem.GetMorganFingerprintAsBitVect(mol2, 2)
+        return DataStructs.TanimotoSimilarity(fp1, fp2)
+    return 0.0
+
+def evaluar_similitud(kegg_id):
+    """Proceso individual para evaluar similitud"""
+    smiles = get_smiles_from_kegg(kegg_id)
+    if smiles:
+        sim = tanimoto_similarity_pair(smiles_base, smiles)
+        if sim >= umbral_similitud:
+            return (kegg_id, smiles, sim)
+    return None
+
+# ---------- EJECUCIÓN PRINCIPAL ----------
+
+if __name__ == '__main__':
+    print("Obteniendo lista completa de compuestos KEGG...")
+    kegg_ids = get_all_kegg_ids()
+    print(f"Total de compuestos a analizar: {len(kegg_ids)}")
+
+    print(f"Iniciando procesamiento en paralelo con {num_procesos} núcleos...")
+    with mp.Pool(num_procesos) as pool:
+        resultados = pool.map(evaluar_similitud, kegg_ids)
+
+    # Filtrar resultados válidos
+    resultados = [r for r in resultados if r is not None]
+
+    # Ordenar por similitud descendente
+    resultados.sort(key=lambda x: x[2], reverse=True)
+
+    # Guardar en CSV
+    with open("resultados_similares_kegg.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["KEGG_ID", "SMILES", "Similitud_Tanimoto"])
+        writer.writerows(resultados)
+
+    print(f"\n✅ Total compuestos similares encontrados: {len(resultados)}")
+    print("📁 Guardados en: resultados_similares_kegg.csv")
+
+    # Mostrar primeros 6 con imagen
+    if resultados:
+        print("\n🔬 Mostrando primeras moléculas similares...")
+        mols = [Chem.MolFromSmiles(r[1]) for r in resultados[:6]]
+        img = Draw.MolsToGridImage(mols, molsPerRow=3, subImgSize=(200,200))
+        img.show()
 

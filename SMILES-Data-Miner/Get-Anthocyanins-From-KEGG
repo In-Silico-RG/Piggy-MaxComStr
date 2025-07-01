@@ -1,1 +1,4 @@
+from rdkit import Chem
+from rdkit.Chem.Draw import IPythonConsole
+from rdkit.Chem import Draw
 

@@ -1,5 +1,6 @@
 !pip install tqdm rdkit
 from tqdm import tqdm
+import os
 
 import requests
 from rdkit import Chem

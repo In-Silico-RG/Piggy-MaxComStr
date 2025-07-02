@@ -18,8 +18,9 @@ from IPython.display import display
 fingerprint_cache = {}
 
 # 🔧 User configuration
-SMILES_BASE = 'O'
-SIMILARITY_THRESHOLD = 0.0
+#  GET XANTHOPHYLLS
+DEFAULT_SMILES_BASE = 'CC(=O)OC1=CC=CC=C1C(=O)O'
+SIMILARITY_THRESHOLD = 0.8
 PAUSE_BETWEEN_REQUESTS = 0.2
 N_PROCESSES = mp.cpu_count()
 FINGERPRINT_NBITS = 2048

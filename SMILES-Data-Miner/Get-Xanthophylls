@@ -1,81 +1,124 @@
+# If running in Colab or a fresh Jupyter environment, uncomment the next line:
+# !pip install tqdm rdkit requests
+import os
 import requests
 from rdkit import Chem
 from rdkit.Chem import AllChem, Draw
 from rdkit import DataStructs
+import multiprocessing as mp
 import csv
 import time
-import multiprocessing as mp
+from tqdm.notebook import tqdm  # For Jupyter-friendly progress bars
+import logging
 
-# -------- CONFIGURACIÓN --------
-smiles_base = "CC1=C[C@H](O)CC(C)(C)[C@H]1/C=C/C(C)=C/C=C/C(C)=C/C=C/C=C(C)/C=C/C=C(C)/C=C/C1=C(C)C[C@@H](O)CC1(C)C"
-umbral_similitud = 0.7
-pausa = 0.1  # segundos entre descargas
-ruta_csv = "resultados_similares_kegg.csv"
+# User-editable configuration
+SMILES_BASE = 'CC(=O)OC1=CC=CC=C1C(=O)O'
+SIMILARITY_THRESHOLD = 0.7
+PAUSE_BETWEEN_REQUESTS = 0.2
+N_PROCESSES = mp.cpu_count()
+FINGERPRINT_NBITS = 2048
+FINGERPRINT_RADIUS = 2
+KEGG_IDS_FILE = 'compounds.txt'
+OUTPUT_CSV = 'resultados_similares_kegg.csv'
+FAILED_CSV = 'failed_kegg_ids.csv'
+MOLECULE_IMAGE = 'mols_grid.png'
 
-# Convertir SMILES base a huella molecular (fuera del proceso paralelo)
-mol_base = Chem.MolFromSmiles(smiles_base)
-fp_base = AllChem.GetMorganFingerprintAsBitVect(mol_base, 2)
+logging.basicConfig(filename='smiles_data_miner.log', level=logging.INFO,
+                    format='%(asctime)s %(levelname)s: %(message)s')
 
-# -------- FUNCIONES --------
-def get_all_kegg_ids():
-    print("🔎 Descargando lista de compuestos KEGG...")
-    url = 'https://rest.kegg.jp/list/compound'
-    r = requests.get(url)
-    lines = r.text.strip().split('\n')
-    return [line.split('\t')[0].replace("cpd:", "") for line in lines]
 
-def get_smiles_from_kegg(kegg_id):
+def read_kegg_ids(filename):
+    """Read KEGG compound IDs from a local file."""
+    if not os.path.exists(filename):
+        logging.error(f"File not found: {filename}")
+        return []
+    with open(filename, 'r') as f:
+        return [line.strip().split('\t')[0] for line in f if line.strip()]
+
+def get_smiles_from_kegg(kegg_id, pause=PAUSE_BETWEEN_REQUESTS, timeout=10):
+    """Fetch the SMILES string for a given KEGG ID using the KEGG REST API."""
     url = f'https://rest.kegg.jp/get/{kegg_id}/mol'
     try:
-        time.sleep(pausa)
-        r = requests.get(url, timeout=10)
-        if r.status_code == 200:
-            mol = Chem.MolFromMolBlock(r.text)
-            if mol:
-                return Chem.MolToSmiles(mol)
-    except Exception:
-        return None
-    return None
-
-def evaluar_compuesto(kegg_id):
-    """Función paralelizable: descarga, convierte y compara"""
-    smiles = get_smiles_from_kegg(kegg_id)
-    if smiles:
-        mol = Chem.MolFromSmiles(smiles)
+        time.sleep(pause)
+        response = requests.get(url, timeout=timeout)
+        response.raise_for_status()
+        mol = Chem.MolFromMolBlock(response.text)
         if mol:
-            fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2)
-            sim = DataStructs.TanimotoSimilarity(fp_base, fp)
-            if sim >= umbral_similitud:
-                print(f"{kegg_id} → Similitud: {sim:.3f}")
-                return (kegg_id, smiles, sim)
+            return Chem.MolToSmiles(mol)
+    except Exception as e:
+        logging.warning(f"[{kegg_id}] Error fetching SMILES: {e}")
     return None
 
-# -------- EJECUCIÓN PRINCIPAL --------
-if __name__ == '__main__':
-    print("📦 Obteniendo identificadores KEGG...")
-    kegg_ids = get_all_kegg_ids()
-    print(f"📋 Total de compuestos KEGG: {len(kegg_ids)}")
+def tanimoto_similarity_pair(smiles1, smiles2, nbits=FINGERPRINT_NBITS, radius=FINGERPRINT_RADIUS):
+    """Calculate Tanimoto similarity between two SMILES strings."""
+    mol1 = Chem.MolFromSmiles(smiles1)
+    mol2 = Chem.MolFromSmiles(smiles2)
+    if mol1 and mol2:
+        fp1 = AllChem.GetMorganFingerprintAsBitVect(mol1, radius=radius, nBits=nbits)
+        fp2 = AllChem.GetMorganFingerprintAsBitVect(mol2, radius=radius, nBits=nbits)
+        return DataStructs.TanimotoSimilarity(fp1, fp2)
+    return 0.0
 
-    print("\n⚙️ Procesando en paralelo...")
-    with mp.Pool(mp.cpu_count()) as pool:
-        resultados = pool.map(evaluar_compuesto, kegg_ids)
+def evaluar_similitud(args):
+    """Wrapper for parallel similarity evaluation."""
+    kegg_id, smiles_base, threshold, pause, timeout, nbits, radius = args
+    if not kegg_id or not isinstance(kegg_id, str):
+        return None
+    smiles = get_smiles_from_kegg(kegg_id, pause, timeout)
+    if smiles:
+        sim = tanimoto_similarity_pair(smiles_base, smiles, nbits, radius)
+        if sim >= threshold:
+            return (kegg_id, smiles, sim)
+    return None
 
-    # Filtrar resultados válidos
-    resultados = [r for r in resultados if r is not None]
+kegg_ids = read_kegg_ids(KEGG_IDS_FILE)
+print(f"Total KEGG compounds to analyze: {len(kegg_ids)}")
+if len(kegg_ids) > 0:
+    print(f"First 5 KEGG IDs: {kegg_ids[:5]}")
 
-    if resultados:
-        resultados.sort(key=lambda x: x[2], reverse=True)
-        with open(ruta_csv, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["KEGG_ID", "SMILES", "Similitud_Tanimoto"])
-            writer.writerows(resultados)
-        print(f"\n✅ {len(resultados)} compuestos similares encontrados.")
-        print("📁 Resultados guardados en:", ruta_csv)
+# Prepare pool arguments
+pool_args = [
+    (kegg_id, SMILES_BASE, SIMILARITY_THRESHOLD, PAUSE_BETWEEN_REQUESTS, 10, FINGERPRINT_NBITS, FINGERPRINT_RADIUS)
+    for kegg_id in kegg_ids
+]
 
-        # Mostrar primeros 6 compuestos similares
-        mols = [Chem.MolFromSmiles(r[1]) for r in resultados[:6]]
-        img = Draw.MolsToGridImage(mols, molsPerRow=3, subImgSize=(200,200))
-        img.show()
-    else:
-        print("\n⚠️ No se encontraron compuestos con similitud mayor al umbral.")
+resultados = []
+failed_ids = []
+
+with mp.Pool(N_PROCESSES) as pool:
+    for res, kegg_id in zip(tqdm(pool.imap_unordered(evaluar_similitud, pool_args), total=len(pool_args)), kegg_ids):
+        if res is not None:
+            resultados.append(res)
+        else:
+            failed_ids.append(kegg_id)
+
+print(f"Compounds with similarity >= {SIMILARITY_THRESHOLD}: {len(resultados)}")
+if failed_ids:
+    print(f"Failed KEGG IDs: {failed_ids[:5]} ... total: {len(failed_ids)}")
+
+import pandas as pd
+
+# Sort results by similarity descending
+resultados.sort(key=lambda x: x[2], reverse=True)
+
+pd.DataFrame(resultados, columns=["KEGG_ID", "SMILES", "Tanimoto_Similarity"]).to_csv(OUTPUT_CSV, index=False)
+print(f"Results saved to: {OUTPUT_CSV}")
+
+if failed_ids:
+    pd.DataFrame(failed_ids, columns=["KEGG_ID"]).to_csv(FAILED_CSV, index=False)
+    print(f"Failed KEGG IDs saved to: {FAILED_CSV}")
+
+if resultados:
+    mols = [Chem.MolFromSmiles(r[1]) for r in resultados[:6]]
+    img = Draw.MolsToGridImage(mols, molsPerRow=3, subImgSize=(200, 200))
+    img.save(MOLECULE_IMAGE)
+    print(f"Top molecules grid image saved as: {MOLECULE_IMAGE}")
+    display(img)
+else:
+    print("No molecules found above the similarity threshold.")
+
+# Load and show the top 10 results in the notebook
+if os.path.exists(OUTPUT_CSV):
+    df = pd.read_csv(OUTPUT_CSV)
+    df.head(10)
 

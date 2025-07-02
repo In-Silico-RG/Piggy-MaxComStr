@@ -16,6 +16,14 @@ pausa_entre_solicitudes = 0.2
 num_procesos = mp.cpu_count()
 
 # === Functions ===
+def get_all_kegg_ids(filename='compounds.txt'):
+    """Lee los IDs KEGG de compuestos desde un archivo local."""
+    if not os.path.exists(filename):
+        print(f"Archivo no encontrado: {filename}")
+        return []
+    with open(filename, 'r') as f:
+        return [line.strip().split('\t')[0] for line in f if line.strip()]
+
 def get_smiles_from_kegg(kegg_id):
     url = f'https://rest.kegg.jp/get/{kegg_id}/mol'
     try:
@@ -48,8 +56,13 @@ def evaluar_similitud(kegg_id):
 
 # === Entry point ===
 if __name__ == '__main__':
-    # Replace this with your real list or loading function
-    kegg_ids = ['C00001', 'C00002', 'C00003', 'C00004']  # Example subset
+    print("Obteniendo lista completa de compuestos KEGG...")
+    kegg_ids = get_all_kegg_ids()
+    print(kegg_ids)
+    print(f"Total de compuestos a analizar: {len(kegg_ids)}")
+
+# Replace this with your real list or loading function
+# kegg_ids = ['C00001', 'C00002', 'C00003', 'C00004']  # Example subset
 
     print(f"Iniciando procesamiento en paralelo con {num_procesos} núcleos...")
     with mp.Pool(num_procesos) as pool:

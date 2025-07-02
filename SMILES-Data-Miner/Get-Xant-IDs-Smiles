@@ -1,0 +1,85 @@
+import os
+import requests
+import time
+import logging
+import pandas as pd
+import multiprocessing as mp
+from rdkit import Chem
+from tqdm.notebook import tqdm
+
+# === Config ===
+KEGG_IDS_FILE = 'compounds.txt'
+OUTPUT_CSV = 'kegg_smiles_with_names.csv'
+FAILED_CSV = 'failed_kegg_ids.csv'
+PAUSE_BETWEEN_REQUESTS = 0.2
+TIMEOUT = 10
+MAX_RETRIES = 3
+N_PROCESSES = mp.cpu_count()
+HEADERS = {'User-Agent': 'Mozilla/5.0'}
+
+# === Logging ===
+logging.basicConfig(filename='kegg_smiles_fetch.log', level=logging.INFO,
+                    format='%(asctime)s %(levelname)s: %(message)s')
+
+def read_kegg_ids(filename):
+    if not os.path.exists(filename):
+        logging.error(f"File not found: {filename}")
+        return []
+    with open(filename, 'r') as f:
+        return [line.strip().split('\t')[0] for line in f if line.strip()]
+
+def fetch_with_retries(url, retries=MAX_RETRIES, pause=0.5):
+    for attempt in range(retries):
+        try:
+            time.sleep(PAUSE_BETWEEN_REQUESTS + attempt * pause)
+            r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            logging.warning(f"[Attempt {attempt+1}] Error fetching {url}: {e}")
+    return None
+
+def parse_kegg_entry(text):
+    """Extracts compound name and formula from KEGG flatfile text."""
+    lines = text.splitlines()
+    name = next((line[12:].split(';')[0].strip() for line in lines if line.startswith("NAME")), "Unknown")
+    formula = next((line[12:].strip() for line in lines if line.startswith("FORMULA")), "Unknown")
+    return name, formula
+
+def fetch_kegg_data(kegg_id):
+    """Returns (KEGG_ID, compound_name, formula, SMILES) or None"""
+    base_url = f'https://rest.kegg.jp/get/{kegg_id}'
+    mol_url = f'{base_url}/mol'
+
+    meta_text = fetch_with_retries(base_url)
+    mol_text = fetch_with_retries(mol_url)
+
+    if meta_text and mol_text:
+        name, formula = parse_kegg_entry(meta_text)
+        mol = Chem.MolFromMolBlock(mol_text)
+        if mol:
+            smiles = Chem.MolToSmiles(mol)
+            return (kegg_id, name, formula, smiles)
+
+    return None
+
+# === Main ===
+if __name__ == '__main__':
+    kegg_ids = read_kegg_ids(KEGG_IDS_FILE)
+    print(f"🧪 Total KEGG compounds to process: {len(kegg_ids)}")
+
+    with mp.Pool(N_PROCESSES) as pool:
+        results = list(tqdm(pool.imap_unordered(fetch_kegg_data, kegg_ids), total=len(kegg_ids)))
+
+    cleaned = [r for r in results if r is not None]
+    failed = [k for r, k in zip(results, kegg_ids) if r is None]
+
+    # Save outputs
+    pd.DataFrame(cleaned, columns=["KEGG_ID", "Name", "Formula", "SMILES"]).to_csv(OUTPUT_CSV, index=False)
+    print(f"✅ SMILES + metadata saved to: {OUTPUT_CSV}")
+
+    if failed:
+        pd.DataFrame(failed, columns=["KEGG_ID"]).to_csv(FAILED_CSV, index=False)
+        print(f"⚠️ Failed KEGG IDs saved to: {FAILED_CSV}")
+    else:
+        print("🎉 All KEGG IDs processed successfully.")

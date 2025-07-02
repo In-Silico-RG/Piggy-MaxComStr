@@ -1,20 +1,23 @@
 # If running in Colab or a fresh Jupyter environment, uncomment the next line:
-!pip install tqdm rdkit requests pandas
+# !pip install tqdm rdkit requests pandas
 
 import os
 import requests
+import time
+import logging
+import multiprocessing as mp
+import pandas as pd
 from rdkit import Chem
 from rdkit.Chem import AllChem, Draw
 from rdkit import DataStructs
-import multiprocessing as mp
-import csv
-import time
-from tqdm.notebook import tqdm  # For Jupyter-friendly progress bars
-import logging
-import pandas as pd
-from rdkit.Chem import AllChem
+from PIL import Image
+from tqdm.notebook import tqdm
+from IPython.display import display
 
-# User-editable configuration
+# ✅ In-memory fingerprint cache
+fingerprint_cache = {}
+
+# 🔧 User configuration
 SMILES_BASE = 'O'
 SIMILARITY_THRESHOLD = 0.0
 PAUSE_BETWEEN_REQUESTS = 0.2
@@ -29,43 +32,33 @@ MOLECULE_IMAGE = 'mols_grid.png'
 logging.basicConfig(filename='smiles_data_miner.log', level=logging.INFO,
                     format='%(asctime)s %(levelname)s: %(message)s')
 
-# In-memory cache
-fingerprint_cache = {}
+headers = {
+    'User-Agent': 'Mozilla/5.0'
+}
 
 def read_kegg_ids(filename):
-    """Read KEGG compound IDs from a local file."""
     if not os.path.exists(filename):
         logging.error(f"File not found: {filename}")
         return []
     with open(filename, 'r') as f:
         return [line.strip().split('\t')[0] for line in f if line.strip()]
 
-def get_fingerprint(smiles):
-    """Get cached Morgan fingerprint using generator."""
-    if smiles in fingerprint_cache:
-        return fingerprint_cache[smiles]
+def get_fingerprint(smiles, radius=2, nbits=2048):
+    key = (smiles, radius, nbits)
+    if key in fingerprint_cache:
+        return fingerprint_cache[key]
     mol = Chem.MolFromSmiles(smiles)
     if mol:
-        fp = fingerprint_generator.GetFingerprint(mol)
-        fingerprint_cache[smiles] = fp
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius=radius, nBits=nbits)
+        fingerprint_cache[key] = fp
         return fp
     return None
 
-def read_kegg_ids(filename):
-    """Read KEGG compound IDs from a local file."""
-    if not os.path.exists(filename):
-        logging.error(f"File not found: {filename}")
-        return []
-    with open(filename, 'r') as f:
-        return [line.strip().split('\t')[0] for line in f if line.strip()]
-
 def get_smiles_from_kegg(kegg_id, pause=PAUSE_BETWEEN_REQUESTS, timeout=10):
-    """Fetch the SMILES string for a given KEGG ID using the KEGG REST API."""
     url = f'https://rest.kegg.jp/get/{kegg_id}/mol'
-    print(url)
     try:
         time.sleep(pause)
-        response = requests.get(url, timeout=timeout)
+        response = requests.get(url, headers=headers, timeout=timeout)
         response.raise_for_status()
         mol = Chem.MolFromMolBlock(response.text)
         if mol:
@@ -74,36 +67,28 @@ def get_smiles_from_kegg(kegg_id, pause=PAUSE_BETWEEN_REQUESTS, timeout=10):
         logging.warning(f"[{kegg_id}] Error fetching SMILES: {e}")
     return None
 
-def tanimoto_similarity_pair(smiles1, smiles2):
-    fp1 = get_fingerprint(smiles1)
-    fp2 = get_fingerprint(smiles2)
+def tanimoto_similarity_pair(smiles1, smiles2, nbits=2048, radius=2):
+    fp1 = get_fingerprint(smiles1, radius, nbits)
+    fp2 = get_fingerprint(smiles2, radius, nbits)
     if fp1 and fp2:
         return DataStructs.TanimotoSimilarity(fp1, fp2)
     return 0.0
 
 def evaluar_similitud(args):
-    """Wrapper for parallel similarity evaluation."""
     kegg_id, smiles_base, threshold, pause, timeout, nbits, radius = args
-    print(kegg_id,smiles_base,threshold,pause, timeout, nbits, radius)
     if not kegg_id or not isinstance(kegg_id, str):
         return None
     smiles = get_smiles_from_kegg(kegg_id, pause, timeout)
-    print(smiles)
     if smiles:
         sim = tanimoto_similarity_pair(smiles_base, smiles, nbits, radius)
-        print(sim)
         if sim >= threshold:
             return (kegg_id, smiles, sim)
     return None
 
-
+# --- Main execution ---
 kegg_ids = read_kegg_ids(KEGG_IDS_FILE)
 print(f"Total KEGG compounds to analyze: {len(kegg_ids)}")
-if len(kegg_ids) > 0:
-    print(f"First 10 KEGG IDs: {kegg_ids[:10]}")
 
-
-# Prepare pool arguments
 pool_args = [
     (kegg_id, SMILES_BASE, SIMILARITY_THRESHOLD, PAUSE_BETWEEN_REQUESTS, 10, FINGERPRINT_NBITS, FINGERPRINT_RADIUS)
     for kegg_id in kegg_ids
@@ -112,7 +97,6 @@ pool_args = [
 resultados = []
 failed_ids = []
 
-
 with mp.Pool(N_PROCESSES) as pool:
     for res, kegg_id in zip(tqdm(pool.imap_unordered(evaluar_similitud, pool_args), total=len(pool_args)), kegg_ids):
         if res is not None:
@@ -120,30 +104,58 @@ with mp.Pool(N_PROCESSES) as pool:
         else:
             failed_ids.append(kegg_id)
 
-print(f"Compounds with similarity >= {SIMILARITY_THRESHOLD}: {len(resultados)}")
+print(f"\n✅ Compounds with similarity ≥ {SIMILARITY_THRESHOLD}: {len(resultados)}")
 if failed_ids:
-    print(f"Failed KEGG IDs: {failed_ids[:5]} ... total: {len(failed_ids)}")
+    print(f"⚠️ Failed KEGG IDs (total {len(failed_ids)}): {failed_ids[:5]}...")
 
-
-resultados.sort(key=lambda x: x[2], reverse=True)
-
+# Save results
 pd.DataFrame(resultados, columns=["KEGG_ID", "SMILES", "Tanimoto_Similarity"]).to_csv(OUTPUT_CSV, index=False)
-print(f"Results saved to: {OUTPUT_CSV}")
-
 if failed_ids:
     pd.DataFrame(failed_ids, columns=["KEGG_ID"]).to_csv(FAILED_CSV, index=False)
-    print(f"Failed KEGG IDs saved to: {FAILED_CSV}")
 
+print(f"\n📄 Results saved to: {OUTPUT_CSV}")
+if failed_ids:
+    print(f"📄 Failed IDs saved to: {FAILED_CSV}")
+
+# Image output
 if resultados:
     mols = [Chem.MolFromSmiles(r[1]) for r in resultados[:6]]
-    img = Draw.MolsToGridImage(mols, molsPerRow=3, subImgSize=(200, 200))
+    img = Draw.MolsToGridImage(
+        mols,
+        molsPerRow=3,
+        subImgSize=(200, 200),
+        useSVG=False,
+        returnPNG=False  # ✅ Ensures PIL.Image is returned
+    )
     img.save(MOLECULE_IMAGE)
-    print(f"Top molecules grid image saved as: {MOLECULE_IMAGE}")
-    display(img)
+    print(f"\n🧪 Top molecules grid image saved as: {MOLECULE_IMAGE}")
+    try:
+        display(img)
+    except:
+        print("Image display not supported in this environment.")
 else:
-    print("No molecules found above the similarity threshold.")
+    print("❌ No molecules found above the similarity threshold.")
 
-# Load and show the top 10 results in the notebook
+# Preview top 10
 if os.path.exists(OUTPUT_CSV):
     df = pd.read_csv(OUTPUT_CSV)
-    df.head(10)
+    display(df.head(10))
+
+
+# ✅ 1. Add Labels to Molecules (e.g., KEGG ID or Similarity) 
+# You can pass labels via the legends argument in Draw.MolsToGridImage:
+
+mols = [Chem.MolFromSmiles(r[1]) for r in resultados[:6]]
+legends = [f"{r[0]} ({r[2]:.2f})" for r in resultados[:6]]
+
+img = Draw.MolsToGridImage(
+    mols,
+    molsPerRow=3,
+    subImgSize=(250, 250),
+    legends=legends,
+    useSVG=False,
+    returnPNG=False
+)
+img.save(MOLECULE_IMAGE)
+display(img)
+

@@ -1,5 +1,6 @@
 # If running in Colab or a fresh Jupyter environment, uncomment the next line:
-# !pip install tqdm rdkit requests
+!pip install tqdm rdkit requests pandas
+
 import os
 import requests
 from rdkit import Chem
@@ -10,10 +11,12 @@ import csv
 import time
 from tqdm.notebook import tqdm  # For Jupyter-friendly progress bars
 import logging
+import pandas as pd
+from rdkit.Chem import AllChem
 
 # User-editable configuration
-SMILES_BASE = 'CC(=O)OC1=CC=CC=C1C(=O)O'
-SIMILARITY_THRESHOLD = 0.7
+SMILES_BASE = 'O'
+SIMILARITY_THRESHOLD = 0.0
 PAUSE_BETWEEN_REQUESTS = 0.2
 N_PROCESSES = mp.cpu_count()
 FINGERPRINT_NBITS = 2048
@@ -26,6 +29,27 @@ MOLECULE_IMAGE = 'mols_grid.png'
 logging.basicConfig(filename='smiles_data_miner.log', level=logging.INFO,
                     format='%(asctime)s %(levelname)s: %(message)s')
 
+# In-memory cache
+fingerprint_cache = {}
+
+def read_kegg_ids(filename):
+    """Read KEGG compound IDs from a local file."""
+    if not os.path.exists(filename):
+        logging.error(f"File not found: {filename}")
+        return []
+    with open(filename, 'r') as f:
+        return [line.strip().split('\t')[0] for line in f if line.strip()]
+
+def get_fingerprint(smiles):
+    """Get cached Morgan fingerprint using generator."""
+    if smiles in fingerprint_cache:
+        return fingerprint_cache[smiles]
+    mol = Chem.MolFromSmiles(smiles)
+    if mol:
+        fp = fingerprint_generator.GetFingerprint(mol)
+        fingerprint_cache[smiles] = fp
+        return fp
+    return None
 
 def read_kegg_ids(filename):
     """Read KEGG compound IDs from a local file."""
@@ -38,6 +62,7 @@ def read_kegg_ids(filename):
 def get_smiles_from_kegg(kegg_id, pause=PAUSE_BETWEEN_REQUESTS, timeout=10):
     """Fetch the SMILES string for a given KEGG ID using the KEGG REST API."""
     url = f'https://rest.kegg.jp/get/{kegg_id}/mol'
+    print(url)
     try:
         time.sleep(pause)
         response = requests.get(url, timeout=timeout)
@@ -49,32 +74,34 @@ def get_smiles_from_kegg(kegg_id, pause=PAUSE_BETWEEN_REQUESTS, timeout=10):
         logging.warning(f"[{kegg_id}] Error fetching SMILES: {e}")
     return None
 
-def tanimoto_similarity_pair(smiles1, smiles2, nbits=FINGERPRINT_NBITS, radius=FINGERPRINT_RADIUS):
-    """Calculate Tanimoto similarity between two SMILES strings."""
-    mol1 = Chem.MolFromSmiles(smiles1)
-    mol2 = Chem.MolFromSmiles(smiles2)
-    if mol1 and mol2:
-        fp1 = AllChem.GetMorganFingerprintAsBitVect(mol1, radius=radius, nBits=nbits)
-        fp2 = AllChem.GetMorganFingerprintAsBitVect(mol2, radius=radius, nBits=nbits)
+def tanimoto_similarity_pair(smiles1, smiles2):
+    fp1 = get_fingerprint(smiles1)
+    fp2 = get_fingerprint(smiles2)
+    if fp1 and fp2:
         return DataStructs.TanimotoSimilarity(fp1, fp2)
     return 0.0
 
 def evaluar_similitud(args):
     """Wrapper for parallel similarity evaluation."""
     kegg_id, smiles_base, threshold, pause, timeout, nbits, radius = args
+    print(kegg_id,smiles_base,threshold,pause, timeout, nbits, radius)
     if not kegg_id or not isinstance(kegg_id, str):
         return None
     smiles = get_smiles_from_kegg(kegg_id, pause, timeout)
+    print(smiles)
     if smiles:
         sim = tanimoto_similarity_pair(smiles_base, smiles, nbits, radius)
+        print(sim)
         if sim >= threshold:
             return (kegg_id, smiles, sim)
     return None
 
+
 kegg_ids = read_kegg_ids(KEGG_IDS_FILE)
 print(f"Total KEGG compounds to analyze: {len(kegg_ids)}")
 if len(kegg_ids) > 0:
-    print(f"First 5 KEGG IDs: {kegg_ids[:5]}")
+    print(f"First 10 KEGG IDs: {kegg_ids[:10]}")
+
 
 # Prepare pool arguments
 pool_args = [
@@ -84,6 +111,7 @@ pool_args = [
 
 resultados = []
 failed_ids = []
+
 
 with mp.Pool(N_PROCESSES) as pool:
     for res, kegg_id in zip(tqdm(pool.imap_unordered(evaluar_similitud, pool_args), total=len(pool_args)), kegg_ids):
@@ -96,9 +124,7 @@ print(f"Compounds with similarity >= {SIMILARITY_THRESHOLD}: {len(resultados)}")
 if failed_ids:
     print(f"Failed KEGG IDs: {failed_ids[:5]} ... total: {len(failed_ids)}")
 
-import pandas as pd
 
-# Sort results by similarity descending
 resultados.sort(key=lambda x: x[2], reverse=True)
 
 pd.DataFrame(resultados, columns=["KEGG_ID", "SMILES", "Tanimoto_Similarity"]).to_csv(OUTPUT_CSV, index=False)
@@ -121,4 +147,3 @@ else:
 if os.path.exists(OUTPUT_CSV):
     df = pd.read_csv(OUTPUT_CSV)
     df.head(10)
-
